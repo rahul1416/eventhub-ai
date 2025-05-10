@@ -75,5 +75,11 @@
     "userId": "string1",
     "message": "what is core of string",
     "timestamp": ""
+  },
+  {
+    "eventId": "string",
+    "userId": "string",
+    "message": "string",
+    "timestamp": "string"
   }
 ]
