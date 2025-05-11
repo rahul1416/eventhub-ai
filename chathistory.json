@@ -81,5 +81,23 @@
     "userId": "string",
     "message": "string",
     "timestamp": "string"
+  },
+  {
+    "eventId": "string",
+    "userId": "string",
+    "message": "string",
+    "timestamp": "string"
+  },
+  {
+    "eventId": "681e53bdbab1a56edb9e5e62",
+    "userId": "681e52223ab5f5946dcacec0",
+    "message": "what is fundraising idea",
+    "timestamp": ""
+  },
+  {
+    "eventId": "681e53bdbab1a56edb9e5e62",
+    "userId": "681e52223ab5f5946dcacec0",
+    "message": "what is fundraising idea",
+    "timestamp": ""
   }
 ]
