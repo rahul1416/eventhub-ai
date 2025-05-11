@@ -2,5 +2,5 @@
 
 ## how to run
 ```
-uvicorn chatsummary:app --reload
+uvicorn main:app --reload
 ```
