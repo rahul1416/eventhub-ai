@@ -4,4 +4,8 @@ scikit-learn
 numpy
 python-multipart
 pydantic
-
+langchain
+langchain_groq
+gunicorn
+dotenv
+google
