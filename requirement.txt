@@ -2,10 +2,12 @@ fastapi
 uvicorn[standard]
 scikit-learn
 numpy
+pandas
 python-multipart
+python-dotenv
 pydantic
+requests
+google-genai
 langchain
 langchain_groq
-gunicorn
-dotenv
-google
+
