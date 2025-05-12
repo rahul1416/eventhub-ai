@@ -1,4 +1,4 @@
-import json
+from pymongo import MongoClient
 from datetime import datetime, timezone
 from collections import defaultdict
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -6,89 +6,111 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import OneHotEncoder
 import numpy as np
+from dotenv import load_dotenv
+import os
+from bson import ObjectId
+from dateutil import parser
 
-# Load data
-with open('data/events.json', 'r') as f:
-    events = json.load(f)
+# Load environment variables
+load_dotenv()
 
-with open('data/registrations.json', 'r') as f:
-    registrations = json.load(f)
+MONGO_URI = os.getenv("MONGO_URI")
+if not MONGO_URI:
+    raise ValueError("MongoDB URI is missing in environment variables.")
 
-with open('data/users.json', 'r') as f:
-    users = json.load(f)
+client = MongoClient(MONGO_URI)
+db = client['eventhub']
+events_collection = db['events']
+registrations_collection = db['registrations']
+users_collection = db['users']
+
+print("Loaded events:", events_collection.count_documents({}))
+print("Loaded registrations:", registrations_collection.count_documents({}))
+
+def parse_to_utc(dt):
+    """Ensure all datetimes are UTC-aware"""
+    if isinstance(dt, str):
+        dt = parser.isoparse(dt)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
 
 def get_user_past_events(user_id):
-    past_event_ids = [r['eventId'] for r in registrations if r['userId'] == user_id]
-    return [e for e in events if e['_id'] in past_event_ids]
+    user_oid = ObjectId(user_id)
+    registrations = registrations_collection.find({"userId": user_oid})
+    event_ids = [r["eventId"] for r in registrations]
+    return list(events_collection.find({"_id": {"$in": event_ids}}))
 
-def filter_candidate_events(user_id, include_attended_events=True):
-    current_time = datetime.now(timezone.utc)
-    candidates = []
-    registered_event_ids = {r['eventId'] for r in registrations if r['userId'] == user_id}
-    for event in events:
-        end_time = datetime.fromisoformat(event['endTime'].replace('+00:00', '+00:00')).replace(tzinfo=timezone.utc)
-        is_past = end_time <= current_time
-        is_registered = event['_id'] in registered_event_ids
-        include_event = (include_attended_events and is_past) if is_registered else (event['status'] == 'live' and (not is_past or include_attended_events))
-        if include_event:
-            event_copy = event.copy()
-            event_copy.update({
-                'is_past': is_past,
-                'is_registered': is_registered,
-                'user_attended': is_registered and is_past
-            })
-            candidates.append(event_copy)
-    return candidates
+def filter_candidate_events(user_id):
+    user_oid = ObjectId(user_id)
+    registered_event_ids = set(
+        r["eventId"] for r in registrations_collection.find({"userId": user_oid})
+    )
+    # No comparison with datetime — rely only on 'status'
+    candidate_events = list(events_collection.find({
+        "status": {"$in": ["live", "upcoming"]},
+        "_id": {"$nin": list(registered_event_ids)}
+    }))
+    return candidate_events
 
-def cluster(events, n_clusters=5):
-    descriptions = [e["description"] for e in events]
+def cluster(events_list, n_clusters=5):
+    descriptions = [e.get("description", "") for e in events_list]
     tfidf = TfidfVectorizer(max_features=50, stop_words="english")
     tfidf_features = tfidf.fit_transform(descriptions).toarray()
-    event_types = [e["eventType"] for e in events]
-    organizers = [e["organizerId"] for e in events]
+
+    event_types = [e.get("eventType", "unknown") for e in events_list]
+    organizers = [str(e.get("organizerId", "unknown")) for e in events_list]
     encoder = OneHotEncoder(handle_unknown='ignore')
     categorical_features = encoder.fit_transform(np.column_stack([event_types, organizers])).toarray()
+
     features = np.hstack([tfidf_features, categorical_features])
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    kmeans = KMeans(n_clusters=min(n_clusters, len(events_list)), random_state=42, n_init=10)
     clusters = kmeans.fit_predict(features)
-    for i, event in enumerate(events):
+
+    for i, event in enumerate(events_list):
         event["cluster"] = int(clusters[i])
-    return events
+    return events_list
 
 def recommend_events(user_id, top_n=3):
-    clustered_events = cluster(events)
-    past_events = get_user_past_events(user_id)
-    user_clusters = list(set([e["cluster"] for e in past_events])) if past_events else []
-    candidate_events = filter_candidate_events(user_id)
+    user_oid = ObjectId(user_id)
+    past_events = get_user_past_events(user_oid)
+    live_events = list(events_collection.find({"status": {"$in": ["live", "upcoming"]}}))
 
-    if candidate_events:
-        event_descriptions = [e["description"] for e in candidate_events]
-        past_descriptions = [e["description"] for e in past_events] if past_events else [""]
-        tfidf = TfidfVectorizer(stop_words="english")
-        tfidf_matrix = tfidf.fit_transform(event_descriptions + past_descriptions)
-        candidate_vectors = tfidf_matrix[:len(candidate_events)]
-        past_vectors = tfidf_matrix[len(candidate_events):]
-        similarity_scores = cosine_similarity(past_vectors, candidate_vectors).mean(axis=0) if past_events else [0.5]*len(candidate_events)
-        scored_events = []
-        for idx, event in enumerate(candidate_events):
-            cluster_score = 1 if user_clusters and event["cluster"] in user_clusters else 0.5
-            type_score = 1 if past_events and event["eventType"] in [e["eventType"] for e in past_events] else 0.5
-            start_time = datetime.fromisoformat(event["startTime"].replace("+00:00", "+00:00")).replace(tzinfo=timezone.utc)
-            days_until_start = (start_time - datetime.now(timezone.utc)).days
-            time_score = 1 / (1 + abs(days_until_start))
-            score = (0.4 * similarity_scores[idx] + 0.3 * cluster_score + 0.2 * type_score + 0.1 * time_score)
-            scored_events.append((event, score))
-        scored_events.sort(key=lambda x: x[1], reverse=True)
-        return [event for event, _ in scored_events[:top_n]]
+    if not live_events:
+        return []
 
-    event_popularity = defaultdict(int)
-    for reg in registrations:
-        event_popularity[reg["eventId"]] += 1
-    user_registered_ids = {r["eventId"] for r in registrations if r["userId"] == user_id}
-    if user_clusters:
-        cluster_events = [e for e in clustered_events if e["cluster"] in user_clusters and e["_id"] not in user_registered_ids]
-        cluster_events.sort(key=lambda x: -event_popularity[x["_id"]])
-        return cluster_events[:top_n] if cluster_events else []
-    all_events = [e for e in clustered_events if e["_id"] not in user_registered_ids]
-    all_events.sort(key=lambda x: -event_popularity[x["_id"]])
-    return all_events[:top_n]
+    clustered_events = cluster(live_events)
+    user_clusters = list(set([e.get("cluster") for e in past_events if "cluster" in e])) if past_events else []
+
+    candidate_events = filter_candidate_events(user_oid)
+    if not candidate_events:
+        # Fallback: most recent or popular events
+        return list(events_collection.find().sort([("createdAt", -1)]).limit(top_n))
+
+    event_descriptions = [e.get("description", "") for e in candidate_events]
+    past_descriptions = [e.get("description", "") for e in past_events] if past_events else [""]
+
+    tfidf = TfidfVectorizer(stop_words="english")
+    tfidf_matrix = tfidf.fit_transform(event_descriptions + past_descriptions)
+    candidate_vectors = tfidf_matrix[:len(candidate_events)]
+    past_vectors = tfidf_matrix[len(candidate_events):]
+
+    similarity_scores = cosine_similarity(past_vectors, candidate_vectors).mean(axis=0) if past_events else [0.5] * len(candidate_events)
+
+    scored_events = []
+    for idx, event in enumerate(candidate_events):
+        cluster_score = 1 if user_clusters and event.get("cluster") in user_clusters else 0.5
+        type_score = 1 if past_events and event.get("eventType", "") in [e.get("eventType", "") for e in past_events] else 0.5
+        score = (0.5 * similarity_scores[idx]) + (0.3 * cluster_score) + (0.2 * type_score)
+        scored_events.append((event, score))
+
+    scored_events.sort(key=lambda x: x[1], reverse=True)
+    return [event for event, _ in scored_events[:top_n]]
+
+# Example usage:
+# if __name__ == "__main__":
+# user_id = "681e52223ab5f5946dcacec0"
+# recommended = recommend_events(user_id)
+# print(recommended)
