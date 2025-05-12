@@ -10,4 +10,5 @@ requests
 google-genai
 langchain
 langchain_groq
+pymongo
 
